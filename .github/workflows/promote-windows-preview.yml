@@ -1,0 +1,88 @@
+name: Promote CareerOS Windows preview
+run-name: Promote ${{ inputs.tag }} (${{ inputs.source_sha }})
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable Windows preview tag
+        required: true
+        type: string
+      source_sha:
+        description: Source commit accepted by the private full workflow
+        required: true
+        type: string
+      sha256:
+        description: Accepted installer SHA-256
+        required: true
+        type: string
+      acceptance_run:
+        description: Successful private full acceptance run
+        required: true
+        type: string
+      stable_tag:
+        description: Existing Mac stable tag to preserve
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: windows-preview-promotion-${{ inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Verify staged installer and publish through Actions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          INSTALLER_SHA256: ${{ inputs.sha256 }}
+          ACCEPTANCE_RUN: ${{ inputs.acceptance_run }}
+          STABLE_TAG: ${{ inputs.stable_tag }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, re, subprocess, tempfile, time
+          repo = 'JR-Academy-AI/careeros-releases'
+          tag, source, digest, accepted, stable = [os.environ[key] for key in ['PREVIEW_TAG', 'SOURCE_SHA', 'INSTALLER_SHA256', 'ACCEPTANCE_RUN', 'STABLE_TAG']]
+          for value, pattern in [(tag,r'v\d+\.\d+\.\d+-windows-preview\.1'),(source,r'[0-9a-f]{40}'),(digest,r'[0-9a-f]{64}'),(accepted,r'\d+'),(stable,r'v\d+\.\d+\.\d+')]:
+              if not re.fullmatch(pattern,value): raise RuntimeError('Invalid promotion input')
+          if os.environ['GITHUB_REF'] != 'refs/heads/main': raise RuntimeError('Only main may promote')
+          def gh(*args): return subprocess.check_output(['gh',*args],text=True)
+          def release(): return json.loads(gh('release','view',tag,'-R',repo,'--json','isDraft,isPrerelease,assets,body,targetCommitish,url'))
+          def current_stable(): return json.loads(gh('release','view','-R',repo,'--json','tagName'))['tagName']
+          allowed={'README.md','LICENSE','.github/workflows/promote-windows-preview.yml'}
+          files=set(subprocess.check_output(['git','ls-tree','-r','--name-only','HEAD'],text=True).splitlines())
+          if not files.issubset(allowed): raise RuntimeError('Public repository contains unexpected source files')
+          item=release()
+          name='CareerOS-windows-x64-setup.exe'
+          if not item['isPrerelease'] or [asset['name'] for asset in item['assets']] != [name]: raise RuntimeError('Unexpected preview assets or status')
+          if item['targetCommitish'] not in ['main',subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()]: raise RuntimeError('Preview must point to the binary repository main')
+          evidence=f'https://github.com/JR-Academy-AI/jr-ai-learning/actions/runs/{accepted}'
+          if any(text not in item['body'] for text in [source,digest,evidence,'未签名']): raise RuntimeError('Staged notes do not match the accepted binary')
+          if current_stable()!=stable: raise RuntimeError('Stable Mac release changed before promotion')
+          with tempfile.TemporaryDirectory() as work:
+              subprocess.check_call(['gh','release','download',tag,'-R',repo,'-p',name,'-D',work])
+              actual=hashlib.file_digest(open(pathlib.Path(work)/name,'rb'),'sha256').hexdigest()
+              if actual!=digest: raise RuntimeError('Staged installer checksum mismatch')
+          if item['isDraft']:
+              subprocess.check_call(['gh','release','edit',tag,'-R',repo,'--draft=false','--prerelease','--latest=false'])
+          item=release()
+          if item['isDraft'] or not item['isPrerelease'] or current_stable()!=stable: raise RuntimeError('Published status or stable Mac read-back mismatch')
+          # Read back the actual public tag tree, not only the current main checkout.
+          tree=json.loads(gh('api',f'repos/{repo}/git/trees/{tag}?recursive=1'))
+          if tree.get('truncated') or any(entry['path'] not in allowed for entry in tree['tree'] if entry['type']=='blob'): raise RuntimeError('Public release tag contains unexpected files')
+          url=f'https://github.com/{repo}/releases/download/{tag}/{name}'
+          for attempt in range(6):
+              probe=subprocess.run(['curl','-sS','-L','--max-time','45','-r','0-1023','-o','/dev/null','-w','%{http_code}',url],capture_output=True,text=True)
+              if probe.returncode==0 and probe.stdout.strip()=='206': break
+              time.sleep(2)
+          else: raise RuntimeError('Anonymous installer download did not return HTTP 206')
+          receipt={'release':item['url'],'download':url,'sourceSha':source,'sha256':digest,'acceptanceRun':accepted,'promotionRun':os.environ['GITHUB_RUN_ID'],'unsigned':True,'http':206,'stableMacRetained':stable}
+          print(json.dumps(receipt))
+          pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text(f"Windows preview published: [{tag}]({item['url']})\n\nUnsigned installer: [{name}]({url})\n\nSHA-256: {digest}\n\nSource: {source}\n\n[Acceptance]({evidence})\n\nMac stable retained: {stable}\n")
